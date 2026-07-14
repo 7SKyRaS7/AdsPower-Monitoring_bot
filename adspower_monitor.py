@@ -298,11 +298,19 @@ class Monitor:
         name_to_id = {g.get("group_name"): g.get("group_id") for g in all_groups}
 
         target_groups = {}
-        for wanted in wanted_names:
-            if wanted in name_to_id:
-                target_groups[wanted] = name_to_id[wanted]
-            else:
-                self.log(f"⚠ Группа '{wanted}' не найдена в AdsPower — проверьте название.")
+        is_all = any(w.strip().lower() in ['*', 'все', 'all'] for w in wanted_names)
+        if is_all:
+            wildcard_name = next(w for w in wanted_names if w.strip().lower() in ['*', 'все', 'all'])
+            wildcard_tag = tag_by_group.get(wildcard_name, "")
+            for name, gid in name_to_id.items():
+                target_groups[name] = gid
+                tag_by_group[name] = wildcard_tag
+        else:
+            for wanted in wanted_names:
+                if wanted in name_to_id:
+                    target_groups[wanted] = name_to_id[wanted]
+                else:
+                    self.log(f"⚠ Группа '{wanted}' не найдена в AdsPower — проверьте название.")
 
         if not target_groups:
             self.log("Ни одна из указанных групп не найдена. Остановка.")
