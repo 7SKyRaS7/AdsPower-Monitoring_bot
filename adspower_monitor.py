@@ -27,6 +27,7 @@ AdsPower Profile Monitor -> Telegram Notifier
 
 import json
 import os
+import platform
 import sys
 import time
 import threading
@@ -575,6 +576,15 @@ class App:
 
 def main():
     root = tk.Tk()
+    if platform.system() == 'Darwin':
+        root.bind_class("Text", "<Command-c>", lambda e: e.widget.event_generate("<<Copy>>"))
+        root.bind_class("Text", "<Command-v>", lambda e: e.widget.event_generate("<<Paste>>"))
+        root.bind_class("Text", "<Command-x>", lambda e: e.widget.event_generate("<<Cut>>"))
+        root.bind_class("Text", "<Command-a>", lambda e: e.widget.event_generate("<<SelectAll>>"))
+        root.bind_class("Entry", "<Command-c>", lambda e: e.widget.event_generate("<<Copy>>"))
+        root.bind_class("Entry", "<Command-v>", lambda e: e.widget.event_generate("<<Paste>>"))
+        root.bind_class("Entry", "<Command-x>", lambda e: e.widget.event_generate("<<Cut>>"))
+        root.bind_class("Entry", "<Command-a>", lambda e: e.widget.event_generate("<<SelectAll>>"))
     App(root)
     root.mainloop()
 
