@@ -19,6 +19,7 @@ AdsPower Profile Monitor -> Telegram Notifier
     python adspower_monitor.py
 """
 
+import argparse
 import json
 import os
 import platform
@@ -257,38 +258,30 @@ class Monitor:
                     self.log(f"❌ Не удалось отправить в Telegram после {max_retries} попыток: {e}")
                     return False
 
-    def run(self):
-        ads = AdsPowerClient(self.config["api_base"], self.config.get("api_key", ""))
-        tg = TelegramClient(self.config["telegram_token"], self.config["telegram_chat_id"])
-
+    def _resolve_groups(self, ads):
         groups_list = self.config.get("groups", [])
         if not groups_list:
-            self.log("Не указано ни одной группы. Добавьте группы и запустите заново.")
-            return
+            self.log("Не указано ни одной группы. Добавьте группы и сохраните настройки.")
+            return None, None
 
         wanted_names = [g["name"] for g in groups_list]
         tag_by_group = {g["name"]: g.get("tag", "") for g in groups_list}
 
-        # --- Resolve groups from AdsPower ---
         self.log("Получаю список групп из AdsPower...")
         all_groups = self._fetch_groups_with_retry(ads)
         if all_groups is None:
-            return
+            return None, None
 
         name_to_id = {g.get("group_name"): g.get("group_id") for g in all_groups}
-        self.log(f"AdsPower вернул {len(name_to_id)} групп: {list(name_to_id.keys())}")
+        self.log(f"AdsPower вернул {len(name_to_id)} групп.")
 
         target_groups = {}
         is_all = any(w.strip().lower() in ['*', 'все', 'all'] for w in wanted_names)
         if is_all:
-            # Find the wildcard tag (from the * row)
             wildcard_entry = next(g for g in groups_list if g["name"].strip().lower() in ['*', 'все', 'all'])
             wildcard_tag = wildcard_entry.get("tag", "")
-            # Add ALL groups from AdsPower
             for name, gid in name_to_id.items():
                 target_groups[name] = gid
-                # Use specific tag if this group was also listed explicitly,
-                # otherwise fall back to wildcard tag
                 if name not in tag_by_group or tag_by_group[name] == "":
                     tag_by_group[name] = wildcard_tag
             self.log(f"Режим «все группы» (*): добавлено {len(target_groups)} групп")
@@ -300,18 +293,47 @@ class Monitor:
                     self.log(f"⚠ Группа '{wanted}' не найдена в AdsPower — проверьте название.")
 
         if not target_groups:
-            self.log("Ни одна из указанных групп не найдена. Остановка.")
-            return
+            self.log("Ни одна из указанных групп не найдена.")
+            return None, None
 
         self.log(f"Слежу за группами ({len(target_groups)}): {', '.join(target_groups.keys())}")
-        self.log(f"Интервал проверки: {self.config['poll_interval']} сек.")
+        self.log(f"Интервал проверки: {self.config.get('poll_interval', 30)} сек.")
+        return target_groups, tag_by_group
 
-        # --- Check for missed profiles (added while bot was offline) ---
-        self._check_missed_profiles(ads, tg, target_groups, tag_by_group)
+    def run(self):
+        ads = AdsPowerClient(self.config["api_base"], self.config.get("api_key", ""))
+        tg = TelegramClient(self.config["telegram_token"], self.config["telegram_chat_id"])
 
-        # --- Main monitoring loop ---
+        target_groups, tag_by_group = self._resolve_groups(ads)
+        if target_groups is not None:
+            self._check_missed_profiles(ads, tg, target_groups, tag_by_group)
+
+        last_config_mtime = os.path.getmtime(CONFIG_PATH) if os.path.exists(CONFIG_PATH) else 0
+
         consecutive_errors = 0
         while not self.stop_event.is_set():
+            # Hot-reload config
+            try:
+                current_mtime = os.path.getmtime(CONFIG_PATH) if os.path.exists(CONFIG_PATH) else 0
+                if current_mtime > last_config_mtime:
+                    self.log("Обнаружено изменение config.json, перезагружаю настройки...")
+                    self.config = load_config()
+                    last_config_mtime = current_mtime
+                    ads = AdsPowerClient(self.config["api_base"], self.config.get("api_key", ""))
+                    tg = TelegramClient(self.config["telegram_token"], self.config["telegram_chat_id"])
+                    
+                    new_targets, new_tags = self._resolve_groups(ads)
+                    if new_targets is not None:
+                        target_groups, tag_by_group = new_targets, new_tags
+                        self._check_missed_profiles(ads, tg, target_groups, tag_by_group)
+            except Exception as e:
+                self.log(f"⚠ Ошибка при горячей перезагрузке конфига: {e}")
+
+            if not target_groups:
+                self.log("Нет валидных групп для мониторинга. Жду изменений в конфиге...")
+                time.sleep(5)
+                continue
+
             try:
                 self._poll_once(ads, tg, target_groups, tag_by_group)
                 consecutive_errors = 0  # reset on success
@@ -563,6 +585,14 @@ class App:
 
         self._log_line_count = 0
 
+        # Check for headless lock file
+        lock_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor.lock")
+        if os.path.exists(lock_file):
+            self.start_btn.configure(state="disabled")
+            self.stop_btn.configure(state="disabled")
+            self.log("ℹ Обнаружен фоновый процесс (headless). Мониторинг работает в фоне.")
+            self.log("ℹ Вы можете изменять настройки и сохранять их — они применятся автоматически.")
+
     # ------------------------------------------------------------------
     # Table management
     # ------------------------------------------------------------------
@@ -778,6 +808,45 @@ class App:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="AdsPower Telegram Monitor")
+    parser.add_argument("--headless", action="store_true", help="Run without GUI in background")
+    args = parser.parse_args()
+
+    if args.headless:
+        print("Запуск в headless режиме...")
+        config = load_config()
+        stop_event = threading.Event()
+        
+        lock_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor.lock")
+        try:
+            with open(lock_file_path, "w") as f:
+                f.write(str(os.getpid()))
+        except Exception:
+            pass
+            
+        # Setup file logging
+        log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor.log")
+        def headless_log(msg):
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            line = f"[{ts}] {msg}"
+            print(line)
+            try:
+                with open(log_file_path, "a", encoding="utf-8") as lf:
+                    lf.write(line + "\n")
+            except Exception:
+                pass
+                
+        monitor = Monitor(config, headless_log, stop_event)
+        try:
+            monitor.run()
+        except KeyboardInterrupt:
+            print("Остановка по Ctrl+C...")
+            stop_event.set()
+        finally:
+            if os.path.exists(lock_file_path):
+                os.remove(lock_file_path)
+        return
+
     root = tk.Tk()
     if platform.system() == 'Darwin':
         root.bind_class("Text", "<Command-c>", lambda e: e.widget.event_generate("<<Copy>>"))
