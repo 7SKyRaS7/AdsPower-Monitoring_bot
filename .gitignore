@@ -1,0 +1,5 @@
+config.json
+seen_profiles.json
+.DS_Store
+__pycache__/
+*.pyc
