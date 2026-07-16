@@ -330,8 +330,17 @@ class Monitor:
                 self.log(f"⚠ Ошибка при горячей перезагрузке конфига: {e}")
 
             if not target_groups:
-                self.log("Нет валидных групп для мониторинга. Жду изменений в конфиге...")
-                time.sleep(5)
+                self.log("Нет валидных групп (или ошибка связи). Повторная попытка через 30 сек...")
+                waited = 0
+                while waited < 30 and not self.stop_event.is_set():
+                    time.sleep(1)
+                    waited += 1
+                    
+                if not self.stop_event.is_set():
+                    new_targets, new_tags = self._resolve_groups(ads)
+                    if new_targets is not None:
+                        target_groups, tag_by_group = new_targets, new_tags
+                        self._check_missed_profiles(ads, tg, target_groups, tag_by_group)
                 continue
 
             try:
@@ -553,6 +562,7 @@ class App:
         table_btn_frame.pack(fill="x", pady=(6, 0))
 
         ttk.Button(table_btn_frame, text="＋ Добавить", command=self._add_group_row).pack(side="left", padx=2)
+        ttk.Button(table_btn_frame, text="✏ Изменить", command=self._edit_group_row).pack(side="left", padx=2)
         ttk.Button(table_btn_frame, text="🗑 Удалить", command=self._delete_group_row).pack(side="left", padx=2)
         ttk.Button(table_btn_frame, text="✱ Все группы", command=self._add_all_wildcard).pack(side="left", padx=2)
 
@@ -588,10 +598,19 @@ class App:
         # Check for headless lock file
         lock_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor.lock")
         if os.path.exists(lock_file):
-            self.start_btn.configure(state="disabled")
-            self.stop_btn.configure(state="disabled")
-            self.log("ℹ Обнаружен фоновый процесс (headless). Мониторинг работает в фоне.")
-            self.log("ℹ Вы можете изменять настройки и сохранять их — они применятся автоматически.")
+            try:
+                with open(lock_file, "r") as f:
+                    pid = int(f.read().strip())
+                import signal
+                os.kill(pid, signal.SIGTERM)
+                self.log("ℹ Фоновый процесс был перехвачен и остановлен. Управление у окна.")
+            except Exception:
+                self.log("ℹ Запущен режим окна.")
+            finally:
+                try:
+                    os.remove(lock_file)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Table management
@@ -630,6 +649,57 @@ class App:
         btn_frm = ttk.Frame(dialog)
         btn_frm.grid(row=3, column=0, columnspan=2, pady=10)
         ttk.Button(btn_frm, text="Добавить", command=_ok).pack(side="left", padx=4)
+        ttk.Button(btn_frm, text="Отмена", command=dialog.destroy).pack(side="left", padx=4)
+
+        dialog.columnconfigure(1, weight=1)
+
+    def _edit_group_row(self):
+        """Open a small dialog to edit the selected group row."""
+        selected = self.groups_tree.selection()
+        if not selected:
+            messagebox.showinfo("Изменение", "Выберите строку в таблице для изменения.")
+            return
+        if len(selected) > 1:
+            messagebox.showinfo("Изменение", "Выберите только одну строку для изменения.")
+            return
+
+        item = selected[0]
+        current_values = self.groups_tree.item(item, "values")
+        current_name = current_values[0] if len(current_values) > 0 else ""
+        current_tag = current_values[1] if len(current_values) > 1 else ""
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Изменить группу")
+        dialog.geometry("420x160")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="Название группы:").grid(row=0, column=0, padx=8, pady=8, sticky="w")
+        name_var = tk.StringVar(value=current_name)
+        name_entry = ttk.Entry(dialog, textvariable=name_var, width=35)
+        name_entry.grid(row=0, column=1, padx=8, pady=8, sticky="we")
+        name_entry.focus_set()
+
+        ttk.Label(dialog, text="Тег в Telegram:").grid(row=1, column=0, padx=8, pady=4, sticky="w")
+        tag_var = tk.StringVar(value=current_tag)
+        ttk.Entry(dialog, textvariable=tag_var, width=35).grid(row=1, column=1, padx=8, pady=4, sticky="we")
+
+        ttk.Label(dialog, text="(@username или числовой Telegram ID, можно оставить пустым)", font=("", 9)).grid(
+            row=2, column=0, columnspan=2, padx=8, sticky="w"
+        )
+
+        def _ok(event=None):
+            name = name_var.get().strip()
+            if name:
+                self.groups_tree.item(item, values=(name, tag_var.get().strip()))
+            dialog.destroy()
+
+        name_entry.bind("<Return>", _ok)
+
+        btn_frm = ttk.Frame(dialog)
+        btn_frm.grid(row=3, column=0, columnspan=2, pady=10)
+        ttk.Button(btn_frm, text="Сохранить", command=_ok).pack(side="left", padx=4)
         ttk.Button(btn_frm, text="Отмена", command=dialog.destroy).pack(side="left", padx=4)
 
         dialog.columnconfigure(1, weight=1)
@@ -802,8 +872,27 @@ class App:
         self.log("Останавливаю мониторинг...")
 
     def on_close(self):
-        self.stop_event.set()
         self.save_settings()
+        
+        res = messagebox.askyesnocancel("Выход", "Оставить бота работать в фоновом режиме?")
+        if res is None:
+            return  # Cancel close
+            
+        self.stop_event.set()
+        
+        if res is True:
+            import subprocess
+            import sys
+            try:
+                if platform.system() == "Windows":
+                    # Use creationflags for detached process on Windows
+                    DETACHED_PROCESS = 0x00000008
+                    subprocess.Popen([sys.executable, sys.argv[0], "--headless"], creationflags=DETACHED_PROCESS)
+                else:
+                    subprocess.Popen([sys.executable, sys.argv[0], "--headless"], start_new_session=True)
+            except Exception as e:
+                self.log(f"⚠ Ошибка запуска фонового режима: {e}")
+                
         self.root.destroy()
 
 

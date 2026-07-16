@@ -3,3 +3,5 @@ seen_profiles.json
 .DS_Store
 __pycache__/
 *.pyc
+monitor.log
+monitor.lock
